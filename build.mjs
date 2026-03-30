@@ -1,7 +1,8 @@
 import * as esbuild from 'esbuild';
-import { copyFileSync, mkdirSync, existsSync, writeFileSync } from 'fs';
-import { resolve, dirname } from 'path';
+import { copyFileSync, mkdirSync, existsSync, writeFileSync, readFileSync } from 'fs';
+import { dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { execSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -38,17 +39,29 @@ await Promise.all([
     format: 'iife',
   }),
 
-  // Popup
+  // Popup - JSX automatic runtime
   esbuild.build({
     ...common,
     entryPoints: ['src/popup/main.tsx'],
     outfile: 'dist/popup/main.js',
     platform: 'browser',
     format: 'esm',
-    jsxFactory: 'React.createElement',
-    jsxFragment: 'React.Fragment',
+    jsx: 'automatic',
   }),
 ]);
+
+// Build CSS with Tailwind
+try {
+  execSync('npx tailwindcss -i src/popup/style.css -o dist/popup/style.css --minify', { stdio: 'inherit' });
+  console.log('\u2705 CSS built');
+} catch(e) {
+  // Fallback: copy plain CSS
+  try {
+    copyFileSync('src/popup/style.css', 'dist/popup/style.css');
+  } catch(_) {
+    writeFileSync('dist/popup/style.css', 'body{margin:0;background:#030712;color:#f9fafb;font-family:system-ui}');
+  }
+}
 
 // Copy static files
 copyFileSync('src/popup/index.html', 'dist/popup/index.html');
@@ -58,12 +71,12 @@ copyFileSync('manifest.json', 'dist/manifest.json');
 try {
   copyFileSync('src/wasm/pvac.js', 'dist/wasm/pvac.js');
   copyFileSync('src/wasm/pvac.wasm', 'dist/wasm/pvac.wasm');
-  console.log('✅ WASM files copied');
+  console.log('\u2705 WASM files copied');
 } catch(e) {
-  console.warn('⚠️  WASM files not found, skipping:', e.message);
+  console.warn('\u26a0\ufe0f  WASM files not found, skipping:', e.message);
 }
 
-// Create placeholder icons (1x1 transparent PNG)
+// Create placeholder icons (indigo square PNG base64)
 const ICON_PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
   'base64'
@@ -73,4 +86,5 @@ for (const size of [16, 48, 128]) {
   if (!existsSync(iconPath)) writeFileSync(iconPath, ICON_PNG);
 }
 
-console.log('✅ Extension built → dist/');
+console.log('\u2705 Extension built \u2192 dist/');
+console.log('\ud83d\udce6 Load dist/ in chrome://extensions (Load unpacked)');
