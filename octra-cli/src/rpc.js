@@ -1,5 +1,4 @@
-// RPC client for Octra node
-import fetch from 'node-fetch';
+// RPC client for Octra node — uses native fetch (Node 18+, no dependencies)
 
 let RPC_URL = 'http://46.101.86.250:8080';
 
@@ -7,14 +6,14 @@ export function setRpcUrl(url) { RPC_URL = url.replace(/\/$/, ''); }
 export function getRpcUrl() { return RPC_URL; }
 
 async function rpcCall(method, params = [], timeout = 10000) {
-  const ctrl = new AbortController();
+  const ctrl  = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeout);
   try {
     const res = await fetch(RPC_URL, {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-      signal: ctrl.signal,
+      body:    JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      signal:  ctrl.signal,
     });
     clearTimeout(timer);
     const data = await res.json();
@@ -30,7 +29,7 @@ async function rpcCall(method, params = [], timeout = 10000) {
 export async function getBalance(address) {
   const r = await rpcCall('octra_getBalance', [address]);
   if (r?.balance_raw !== undefined) return (Number(r.balance_raw) / 1e6).toFixed(6);
-  if (r?.balance !== undefined) return String(r.balance);
+  if (r?.balance     !== undefined) return String(r.balance);
   return '0';
 }
 
