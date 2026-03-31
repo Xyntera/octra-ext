@@ -5,12 +5,11 @@ import { stdin as input, stdout as output } from 'node:process';
 import {
   createNewWallet,
   importFromMnemonic,
-  createWalletFromMnemonic,
+  createWalletFromPrivKey,
   validateMnemonicPhrase,
 } from '../crypto.js';
 import { saveWallet, listWallets, loadWallet, getDefaultAddress } from '../wallet-store.js';
-import { getBalance, getAccount } from '../rpc.js';
-import { setRpcUrl } from '../rpc.js';
+import { getBalance, getAccount, setRpcUrl } from '../rpc.js';
 
 async function prompt(question) {
   const rl = createInterface({ input, output });
@@ -20,8 +19,6 @@ async function prompt(question) {
 }
 
 async function promptSecret(question) {
-  // Note: Node readline doesn't hide input natively on all platforms
-  // For production use a proper secret prompt library
   process.stdout.write(question);
   const rl = createInterface({ input, output: process.stdout, terminal: false });
   const answer = await new Promise(res => rl.once('line', res));
@@ -45,27 +42,35 @@ export function registerWalletCommands(program) {
     .action(async (opts) => {
       const pin  = await promptSecret(chalk.yellow('Set PIN: '));
       const pin2 = await promptSecret(chalk.yellow('Confirm PIN: '));
-      if (pin !== pin2) { console.error(chalk.red('PINs do not match')); process.exit(1); }
-      if (pin.length < 4) { console.error(chalk.red('PIN must be ≥ 4 characters')); process.exit(1); }
+      if (pin !== pin2)  { console.error(chalk.red('PINs do not match')); process.exit(1); }
+      if (pin.length < 4){ console.error(chalk.red('PIN must be ≥ 4 characters')); process.exit(1); }
 
-      const spin = ora('Generating wallet...').start();
-      const w = createNewWallet();
-      w.rpcUrl = opts.rpc;
-      w.name   = opts.name || '';
-      const path = saveWallet(w, pin);
-      spin.succeed(chalk.green('Wallet created!'));
+      const spin = ora('Generating wallet…').start();
+      try {
+        const w    = createNewWallet();
+        w.rpcUrl   = opts.rpc;
+        w.name     = opts.name || '';
+        const path = saveWallet(w, pin);
+        spin.succeed(chalk.green('Wallet created!'));
 
-      console.log('');
-      console.log(chalk.bold('⚠️  WRITE DOWN YOUR RECOVERY PHRASE — never share it!'));
-      console.log(chalk.cyan('─'.repeat(60)));
-      const words = w.mnemonic.split(' ');
-      words.forEach((word, i) => {
-        process.stdout.write(`${chalk.gray((i+1).toString().padStart(2,'0'))}. ${chalk.white(word.padEnd(12))}`);
-        if ((i + 1) % 4 === 0) process.stdout.write('\n');
-      });
-      console.log(chalk.cyan('─'.repeat(60)));
-      console.log(`${chalk.bold('Address:')} ${chalk.green(w.address)}`);
-      console.log(`${chalk.bold('Saved:')}   ${chalk.gray(path)}`);
+        console.log('');
+        console.log(chalk.bold('⚠️  WRITE DOWN YOUR RECOVERY PHRASE — never share it!'));
+        console.log(chalk.cyan('─'.repeat(56)));
+        const words = w.mnemonic.split(' ');
+        words.forEach((word, i) => {
+          process.stdout.write(
+            `${chalk.gray(String(i+1).padStart(2,'0'))}. ${chalk.white(word.padEnd(12))}`
+          );
+          if ((i + 1) % 4 === 0) process.stdout.write('\n');
+        });
+        console.log(chalk.cyan('─'.repeat(56)));
+        console.log(`${chalk.bold('Address:')} ${chalk.green(w.address)}`);
+        console.log(`${chalk.bold('Saved:')}   ${chalk.gray(path)}`);
+        console.log('');
+      } catch (e) {
+        spin.fail(chalk.red(e.message));
+        process.exit(1);
+      }
     });
 
   // ── wallet import ───────────────────────────────────────────────────────────
@@ -79,21 +84,31 @@ export function registerWalletCommands(program) {
       const pin    = await promptSecret(chalk.yellow('Set PIN: '));
       const pin2   = await promptSecret(chalk.yellow('Confirm PIN: '));
       if (pin !== pin2) { console.error(chalk.red('PINs do not match')); process.exit(1); }
+      if (pin.length < 4){ console.error(chalk.red('PIN must be ≥ 4 characters')); process.exit(1); }
 
-      const spin = ora('Importing...').start();
-      let w;
-      if (phrase.split(' ').length >= 12) {
-        w = importFromMnemonic(phrase, 0, parseInt(opts.hdVersion));
-      } else {
-        // raw private key b64
-        const { createWalletFromPrivKey } = await import('../crypto.js');
-        w = createWalletFromPrivKey(phrase);
+      const spin = ora('Importing…').start();
+      try {
+        let w;
+        const wordCount = phrase.trim().split(/\s+/).length;
+        if (wordCount >= 12) {
+          // Mnemonic — try hd_version 1 first (existing wallets), then 2
+          const hdVer = parseInt(opts.hdVersion);
+          w = importFromMnemonic(phrase.trim(), 0, hdVer);
+        } else {
+          // Raw private key base64
+          w = createWalletFromPrivKey(phrase.trim());
+        }
+        w.rpcUrl = opts.rpc;
+        w.name   = '';
+        const path = saveWallet(w, pin);
+        spin.succeed(chalk.green('Wallet imported!'));
+        console.log(`${chalk.bold('Address:')} ${chalk.green(w.address)}`);
+        console.log(`${chalk.bold('Saved:')}   ${chalk.gray(path)}`);
+        console.log('');
+      } catch (e) {
+        spin.fail(chalk.red(e.message));
+        process.exit(1);
       }
-      w.rpcUrl = opts.rpc;
-      const path = saveWallet(w, pin);
-      spin.succeed(chalk.green('Wallet imported!'));
-      console.log(`${chalk.bold('Address:')} ${chalk.green(w.address)}`);
-      console.log(`${chalk.bold('Saved:')}   ${chalk.gray(path)}`);
     });
 
   // ── wallet list ─────────────────────────────────────────────────────────────
@@ -107,7 +122,7 @@ export function registerWalletCommands(program) {
         return;
       }
       console.log(chalk.bold(`\n${'#'.padEnd(4)} ${'Name'.padEnd(20)} Address`));
-      console.log(chalk.gray('─'.repeat(70)));
+      console.log(chalk.gray('─'.repeat(72)));
       wallets.forEach((w, i) => {
         console.log(`${String(i+1).padEnd(4)} ${(w.name||'—').padEnd(20)} ${chalk.cyan(w.address)}`);
       });
@@ -122,11 +137,13 @@ export function registerWalletCommands(program) {
     .action(async (address, opts) => {
       if (opts.rpc) setRpcUrl(opts.rpc);
       const addr = address || getDefaultAddress();
-      if (!addr) { console.error(chalk.red('No wallet found')); process.exit(1); }
-      const spin = ora('Fetching balance...').start();
+      if (!addr) { console.error(chalk.red('No wallet found. Run: octra wallet create')); process.exit(1); }
+      const spin = ora('Fetching balance…').start();
       try {
-        const balance = await getBalance(addr);
-        const account = await getAccount(addr);
+        const [balance, account] = await Promise.all([
+          getBalance(addr),
+          getAccount(addr),
+        ]);
         spin.succeed();
         console.log(`\n${chalk.bold('Address:')} ${chalk.cyan(addr)}`);
         console.log(`${chalk.bold('Balance:')} ${chalk.green(balance)} OCTRA`);
@@ -150,7 +167,7 @@ export function registerWalletCommands(program) {
       if (opts.rpc) setRpcUrl(opts.rpc);
       const addr = address || getDefaultAddress();
       if (!addr) { console.error(chalk.red('No wallet found')); process.exit(1); }
-      const spin = ora('Fetching account info...').start();
+      const spin = ora('Fetching account info…').start();
       try {
         const account = await getAccount(addr, 5);
         spin.succeed();

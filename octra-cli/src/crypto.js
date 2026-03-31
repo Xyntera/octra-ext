@@ -1,10 +1,10 @@
-// Octra crypto — Ed25519 (tweetnacl-compatible) + BIP39 + address derivation
+// Octra crypto — Ed25519 + BIP39 + HD + address derivation
 // Mirrors: octra-labs/webcli crypto_utils.hpp + wallet.hpp
 
 import * as ed from '@noble/ed25519';
 import { sha256 } from '@noble/hashes/sha256';
 import { sha512 } from '@noble/hashes/sha512';
-import { bytesToHex, hexToBytes, concatBytes, utf8ToBytes } from '@noble/hashes/utils';
+import { bytesToHex, concatBytes, utf8ToBytes } from '@noble/hashes/utils';
 import { generateMnemonic, mnemonicToSeedSync, validateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english';
 import { createHmac } from 'node:crypto';
@@ -14,52 +14,47 @@ ed.etc.sha512Sync = (...msgs) => sha512(concatBytes(...msgs));
 // ── BIP39 ────────────────────────────────────────────────────────────────────
 
 export function generateMnemonic12() {
-  return generateMnemonic(wordlist, 128); // 12 words
+  return generateMnemonic(wordlist, 128);
 }
 
 export function validateMnemonicPhrase(phrase) {
   return validateMnemonic(phrase, wordlist);
 }
 
-// ── HD Key Derivation ────────────────────────────────────────────────────────
-// Matches derive_hd_seed() in crypto_utils.hpp (HMAC-SHA512 based, hd_version 2)
+// ── HD Derivation ───────────────────────────────────────────────────────────────
 
 export function mnemonicToMasterSeed(mnemonic) {
-  // BIP39 seed = 64 bytes
   return mnemonicToSeedSync(mnemonic);
 }
 
 export function deriveHdSeed(masterSeed64, index = 0, hdVersion = 2) {
-  // hd_version 2: HMAC-SHA512(master_seed, "octra" || LE32(index))
   const label = hdVersion === 2 ? 'octra' : 'octra-hd';
   const idxBuf = Buffer.alloc(4);
   idxBuf.writeUInt32LE(index, 0);
-  const key = Buffer.from(masterSeed64);
-  const data = Buffer.concat([utf8ToBytes(label), idxBuf]);
+  const key  = Buffer.from(masterSeed64);
+  const data = Buffer.concat([Buffer.from(utf8ToBytes(label)), idxBuf]);
   const hmac = createHmac('sha512', key).update(data).digest();
-  return new Uint8Array(hmac.slice(0, 32)); // first 32 bytes = seed
+  return new Uint8Array(hmac.slice(0, 32));
 }
 
 // ── Key Pair ──────────────────────────────────────────────────────────────────
 
 export function keypairFromSeed(seed32) {
-  // Ed25519 keypair: sk = seed(32) || pk(32)
   const privKey = seed32.slice(0, 32);
   const pubKey  = ed.getPublicKey(privKey);
   return { privKey, pubKey };
 }
 
-// ── Address Derivation ────────────────────────────────────────────────────────
-// derive_address(): SHA256(pubkey) → base58 → left-pad to 44 → prepend "oct"
+// ── Address ──────────────────────────────────────────────────────────────────
 
-const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
 function base58Encode(bytes) {
   let num = BigInt('0x' + bytesToHex(bytes));
   let result = '';
   const base = BigInt(58);
   while (num > 0n) {
-    result = BASE58_ALPHABET[Number(num % base)] + result;
+    result = B58[Number(num % base)] + result;
     num = num / base;
   }
   for (const b of bytes) {
@@ -76,7 +71,7 @@ export function deriveAddress(pubKey) {
   return 'oct' + b58;
 }
 
-// ── Full Wallet Creation ──────────────────────────────────────────────────────
+// ── Wallet creation helpers ────────────────────────────────────────────────────
 
 export function createWalletFromMnemonic(mnemonic, index = 0, hdVersion = 2) {
   const masterSeed = mnemonicToMasterSeed(mnemonic);
@@ -101,22 +96,46 @@ export function createNewWallet() {
 
 export function importFromMnemonic(mnemonic, index = 0, hdVersion = 1) {
   if (!validateMnemonicPhrase(mnemonic)) throw new Error('Invalid mnemonic phrase');
-  // try both hd_version 1 and 2
   return createWalletFromMnemonic(mnemonic, index, hdVersion);
+}
+
+// ── Import from raw private key (base64) ──────────────────────────────────────
+export function createWalletFromPrivKey(privKeyB64) {
+  // Clean input
+  const clean = privKeyB64.replace(/[\n\r\s]/g, '');
+  const raw   = new Uint8Array(Buffer.from(clean, 'base64'));
+
+  let privKey, pubKey;
+  if (raw.length >= 64) {
+    // Full 64-byte keypair (seed+pubkey)
+    privKey = raw.slice(0, 32);
+    pubKey  = raw.slice(32, 64);
+  } else if (raw.length >= 32) {
+    // 32-byte seed
+    privKey = raw.slice(0, 32);
+    pubKey  = ed.getPublicKey(privKey);
+  } else {
+    throw new Error(`Invalid private key length: ${raw.length} bytes (expected 32 or 64)`);
+  }
+
+  const address = deriveAddress(pubKey);
+  return {
+    mnemonic:      '',
+    masterSeedHex: '',
+    privKeyB64:    Buffer.from(privKey).toString('base64'),
+    pubKeyB64:     Buffer.from(pubKey).toString('base64'),
+    address,
+    hdIndex:       0,
+    hdVersion:     0,
+  };
 }
 
 // ── Signing ───────────────────────────────────────────────────────────────────
 
-export function signMessage(messageBytes, privKeyB64) {
-  const privKey = new Uint8Array(Buffer.from(privKeyB64, 'base64'));
-  return ed.sign(messageBytes, privKey);
-}
-
 export async function signTx(txPayload, privKeyB64) {
-  // Octra tx signing: sign SHA256(JSON stringify of sorted tx fields)
-  const msg = utf8ToBytes(JSON.stringify(txPayload));
-  const hash = sha256(msg);
+  const msg     = utf8ToBytes(JSON.stringify(txPayload));
+  const hash    = sha256(msg);
   const privKey = new Uint8Array(Buffer.from(privKeyB64, 'base64'));
-  const sig = await ed.signAsync(hash, privKey);
+  const sig     = await ed.signAsync(hash, privKey);
   return Buffer.from(sig).toString('base64');
 }
