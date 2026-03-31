@@ -1,25 +1,19 @@
 // Transaction builder — exact match of octra-labs/webcli lib/tx_builder.hpp
 //
-// canonical_json key order: from, to_, amount, nonce, ou, timestamp, op_type
-//   (then optional: encrypted_data, message)
-// signing: Ed25519 sign of raw UTF-8 canonical_json bytes (NO sha256 pre-hash)
-// timestamp: float seconds  e.g. 1743400000.123
-// amount: raw int64 string  e.g. "5000000" for 5 OCTRA
+// canonical_json FIXED key order: from, to_, amount, nonce, ou, timestamp, op_type
+// signing: Ed25519(raw canonical_json UTF-8 bytes)  — NO sha256 pre-hash
+// amount: raw int64 string (1 OCTRA = 1000000)
+// timestamp: float seconds
 
-import * as ed from '@noble/ed25519';
-import { sha512 } from '@noble/hashes/sha512';
-import { concatBytes } from '@noble/hashes/utils';
+import { signBytes } from './crypto.js';
 import { submitTx, getAccount, stagingView } from './rpc.js';
-
-ed.etc.sha512Sync = (...msgs) => sha512(concatBytes(...msgs));
 
 const MU = 1_000_000n;
 
 export function toRaw(amount) {
-  const s = String(amount);
-  const [int, frac = ''] = s.split('.');
-  const fracPadded = frac.padEnd(6, '0').slice(0, 6);
-  return BigInt(int) * MU + BigInt(fracPadded);
+  const [int, frac = ''] = String(amount).split('.');
+  const fp = frac.padEnd(6, '0').slice(0, 6);
+  return BigInt(int) * MU + BigInt(fp);
 }
 
 export function fromRaw(raw) {
@@ -27,16 +21,14 @@ export function fromRaw(raw) {
 }
 
 // Exact replica of canonical_json() from tx_builder.hpp
-// Key order is FIXED: from, to_, amount, nonce, ou, timestamp, op_type
-// (then encrypted_data, message if present)
+// Key order is HARDCODED (not alphabetical)
 function canonicalJson(tx) {
-  // timestamp serialized as JSON number (float)
   let s = `{"from":"${tx.from}"`
          + `,"to_":"${tx.to_}"`
          + `,"amount":"${tx.amount}"`
          + `,"nonce":${tx.nonce}`
          + `,"ou":"${tx.ou}"`
-         + `,"timestamp":${JSON.stringify(tx.timestamp)}`
+         + `,"timestamp":${tx.timestamp}`
          + `,"op_type":"${tx.op_type || 'standard'}"`;
   if (tx.encrypted_data) s += `,"encrypted_data":"${tx.encrypted_data}"`;
   if (tx.message)        s += `,"message":"${tx.message}"`;
@@ -44,16 +36,7 @@ function canonicalJson(tx) {
   return s;
 }
 
-// Sign raw canonical_json bytes with Ed25519 (NO sha256 pre-hash)
-// Uses first 32 bytes of privKeyB64 as seed
-async function signCanonical(tx, privKeyB64) {
-  const msg     = Buffer.from(canonicalJson(tx), 'utf8');
-  const privKey = new Uint8Array(Buffer.from(privKeyB64, 'base64').slice(0, 32));
-  const sig     = await ed.signAsync(msg, privKey);
-  return Buffer.from(sig).toString('base64');
-}
-
-// Get nonce including staging/mempool pending txs
+// Get max nonce from chain + staging pool
 export async function getNonce(wallet) {
   try {
     const acc   = await getAccount(wallet.address);
@@ -62,7 +45,7 @@ export async function getNonce(wallet) {
       const sv  = await stagingView();
       const txs = Array.isArray(sv) ? sv : (sv?.transactions ?? sv?.txs ?? []);
       for (const t of txs) {
-        if ((t.from === wallet.address) && t.nonce > nonce) nonce = t.nonce;
+        if (t.from === wallet.address && t.nonce > nonce) nonce = t.nonce;
       }
     } catch { /* staging optional */ }
     return nonce;
@@ -71,14 +54,42 @@ export async function getNonce(wallet) {
 
 async function buildSignSubmit(wallet, fields) {
   const nonce = (await getNonce(wallet)) + 1;
+
   const tx = {
     from:      wallet.address,
+    to_:       fields.to_,
+    amount:    fields.amount,
     nonce,
-    timestamp: Date.now() / 1000,   // float seconds
-    ...fields,
+    ou:        fields.ou,
+    timestamp: Date.now() / 1000,
+    op_type:   fields.op_type || 'standard',
+    ...(fields.encrypted_data ? { encrypted_data: fields.encrypted_data } : {}),
+    ...(fields.message        ? { message: fields.message }               : {}),
   };
-  const signature  = await signCanonical(tx, wallet.privKeyB64);
-  const submitBody = { ...tx, signature, public_key: wallet.pubKeyB64 };
+
+  const canon     = canonicalJson(tx);
+  const msgBytes  = Buffer.from(canon, 'utf8');
+
+  // Debug: print canonical JSON being signed
+  process.stderr.write(`[tx] signing: ${canon}\n`);
+
+  const signature = await signBytes(msgBytes, wallet.privKeyB64);
+
+  // Submit body includes all tx fields + signature + public_key
+  const submitBody = {
+    from:       tx.from,
+    to_:        tx.to_,
+    amount:     tx.amount,
+    nonce:      tx.nonce,
+    ou:         tx.ou,
+    timestamp:  tx.timestamp,
+    op_type:    tx.op_type,
+    signature,
+    public_key: wallet.pubKeyB64,
+    ...(tx.encrypted_data ? { encrypted_data: tx.encrypted_data } : {}),
+    ...(tx.message        ? { message: tx.message }               : {}),
+  };
+
   return submitTx(submitBody);
 }
 
@@ -112,9 +123,11 @@ export async function sendBatch(wallet, recipients) {
       op_type:   'standard',
       ...(r.memo ? { message: r.memo } : {}),
     };
-    const signature  = await signCanonical(tx, wallet.privKeyB64);
-    const submitBody = { ...tx, signature, public_key: wallet.pubKeyB64 };
-    results.push(await submitTx(submitBody));
+    const canon     = canonicalJson(tx);
+    const msgBytes  = Buffer.from(canon, 'utf8');
+    const signature = await signBytes(msgBytes, wallet.privKeyB64);
+    const body = { ...tx, signature, public_key: wallet.pubKeyB64 };
+    results.push(await submitTx(body));
     nonce++;
   }
   return results;
