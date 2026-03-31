@@ -1,91 +1,98 @@
-// Transaction builder — mirrors webcli main.cpp sign_tx_fields + submit_tx
-// All amounts are raw int64 micro-units: 1 OCTRA = 1_000_000
+// Transaction builder — exact match of octra-labs/webcli lib/tx_builder.hpp
+//
+// canonical_json key order: from, to_, amount, nonce, ou, timestamp, op_type
+//   (then optional: encrypted_data, message)
+// signing: Ed25519 sign of raw UTF-8 canonical_json bytes (NO sha256 pre-hash)
+// timestamp: float seconds  e.g. 1743400000.123
+// amount: raw int64 string  e.g. "5000000" for 5 OCTRA
 
 import * as ed from '@noble/ed25519';
-import { sha256 } from '@noble/hashes/sha256';
 import { sha512 } from '@noble/hashes/sha512';
-import { utf8ToBytes, concatBytes } from '@noble/hashes/utils';
-import { submitTx, getAccount, getEncryptedBalance, stagingView } from './rpc.js';
+import { concatBytes } from '@noble/hashes/utils';
+import { submitTx, getAccount, stagingView } from './rpc.js';
 
 ed.etc.sha512Sync = (...msgs) => sha512(concatBytes(...msgs));
 
 const MU = 1_000_000n;
 
 export function toRaw(amount) {
-  const [int, frac = ''] = String(amount).split('.');
+  const s = String(amount);
+  const [int, frac = ''] = s.split('.');
   const fracPadded = frac.padEnd(6, '0').slice(0, 6);
   return BigInt(int) * MU + BigInt(fracPadded);
 }
 
 export function fromRaw(raw) {
-  const n = BigInt(raw);
-  return (Number(n) / 1_000_000).toFixed(6);
+  return (Number(BigInt(raw)) / 1_000_000).toFixed(6);
 }
 
-// canonical_json: sorted keys, no spaces — matches octra::canonical_json()
-function canonicalJson(obj) {
-  const sorted = {};
-  for (const k of Object.keys(obj).sort()) sorted[k] = obj[k];
-  return JSON.stringify(sorted);
+// Exact replica of canonical_json() from tx_builder.hpp
+// Key order is FIXED: from, to_, amount, nonce, ou, timestamp, op_type
+// (then encrypted_data, message if present)
+function canonicalJson(tx) {
+  // timestamp serialized as JSON number (float)
+  let s = `{"from":"${tx.from}"`
+         + `,"to_":"${tx.to_}"`
+         + `,"amount":"${tx.amount}"`
+         + `,"nonce":${tx.nonce}`
+         + `,"ou":"${tx.ou}"`
+         + `,"timestamp":${JSON.stringify(tx.timestamp)}`
+         + `,"op_type":"${tx.op_type || 'standard'}"`;
+  if (tx.encrypted_data) s += `,"encrypted_data":"${tx.encrypted_data}"`;
+  if (tx.message)        s += `,"message":"${tx.message}"`;
+  s += '}';
+  return s;
 }
 
-async function signPayload(payload, privKeyB64) {
-  const msg     = utf8ToBytes(canonicalJson(payload));
-  const hash    = sha256(msg);
+// Sign raw canonical_json bytes with Ed25519 (NO sha256 pre-hash)
+// Uses first 32 bytes of privKeyB64 as seed
+async function signCanonical(tx, privKeyB64) {
+  const msg     = Buffer.from(canonicalJson(tx), 'utf8');
   const privKey = new Uint8Array(Buffer.from(privKeyB64, 'base64').slice(0, 32));
-  const sig     = await ed.signAsync(hash, privKey);
+  const sig     = await ed.signAsync(msg, privKey);
   return Buffer.from(sig).toString('base64');
 }
 
-// Get pending nonce (checks staging/mempool too, like get_nonce_balance in C++)
+// Get nonce including staging/mempool pending txs
 export async function getNonce(wallet) {
   try {
-    const acc = await getAccount(wallet.address);
-    let nonce = acc?.pending_nonce ?? acc?.nonce ?? 0;
-    // Also check staging for our own pending txs
+    const acc   = await getAccount(wallet.address);
+    let nonce   = acc?.pending_nonce ?? acc?.nonce ?? 0;
     try {
-      const staging = await stagingView();
-      const txs = Array.isArray(staging)
-        ? staging
-        : (staging?.transactions ?? staging?.txs ?? []);
-      for (const tx of txs) {
-        if (tx.from === wallet.address && tx.nonce > nonce) {
-          nonce = tx.nonce;
-        }
+      const sv  = await stagingView();
+      const txs = Array.isArray(sv) ? sv : (sv?.transactions ?? sv?.txs ?? []);
+      for (const t of txs) {
+        if ((t.from === wallet.address) && t.nonce > nonce) nonce = t.nonce;
       }
     } catch { /* staging optional */ }
     return nonce;
   } catch { return 0; }
 }
 
-function buildTx(wallet, fields, nonce) {
-  return {
+async function buildSignSubmit(wallet, fields) {
+  const nonce = (await getNonce(wallet)) + 1;
+  const tx = {
     from:      wallet.address,
     nonce,
-    timestamp: Date.now() / 1000,
+    timestamp: Date.now() / 1000,   // float seconds
     ...fields,
   };
-}
-
-async function signAndSubmit(wallet, payload) {
-  const signature = await signPayload(payload, wallet.privKeyB64);
-  const tx = { ...payload, signature, public_key: wallet.pubKeyB64 };
-  return submitTx(tx);
+  const signature  = await signCanonical(tx, wallet.privKeyB64);
+  const submitBody = { ...tx, signature, public_key: wallet.pubKeyB64 };
+  return submitTx(submitBody);
 }
 
 // ─── Standard Transfer ───────────────────────────────────────────────────────
 export async function sendTransfer(wallet, to, amount, memo = '') {
-  const nonce = (await getNonce(wallet)) + 1;
-  const raw   = toRaw(amount);
-  const ou    = raw < 1_000_000_000n ? '10000' : '30000';
-  const payload = buildTx(wallet, {
+  const raw = toRaw(amount);
+  const ou  = raw < 1_000_000_000n ? '10000' : '30000';
+  return buildSignSubmit(wallet, {
     to_:     to,
     amount:  String(raw),
     ou,
     op_type: 'standard',
     ...(memo ? { message: memo } : {}),
-  }, nonce);
-  return signAndSubmit(wallet, payload);
+  });
 }
 
 // ─── Batch Transfer ──────────────────────────────────────────────────────────
@@ -95,53 +102,52 @@ export async function sendBatch(wallet, recipients) {
   for (const r of recipients) {
     const raw = toRaw(r.amount);
     const ou  = raw < 1_000_000_000n ? '10000' : '30000';
-    const payload = buildTx(wallet, {
-      to_:     r.to,
-      amount:  String(raw),
+    const tx  = {
+      from:      wallet.address,
+      to_:       r.to,
+      amount:    String(raw),
+      nonce,
       ou,
-      op_type: 'standard',
+      timestamp: Date.now() / 1000,
+      op_type:   'standard',
       ...(r.memo ? { message: r.memo } : {}),
-    }, nonce);
-    results.push(await signAndSubmit(wallet, payload));
+    };
+    const signature  = await signCanonical(tx, wallet.privKeyB64);
+    const submitBody = { ...tx, signature, public_key: wallet.pubKeyB64 };
+    results.push(await submitTx(submitBody));
     nonce++;
   }
   return results;
 }
 
-// ─── Encrypt Balance (move public → encrypted) ───────────────────────────────────
+// ─── Encrypt Balance (public → encrypted) ───────────────────────────────────────
 export async function encryptBalance(wallet, amount) {
-  const nonce = (await getNonce(wallet)) + 1;
-  const raw   = toRaw(amount);
-  const payload = buildTx(wallet, {
+  const raw = toRaw(amount);
+  return buildSignSubmit(wallet, {
     to_:     wallet.address,
     amount:  String(raw),
     ou:      '10000',
     op_type: 'encrypt',
-  }, nonce);
-  return signAndSubmit(wallet, payload);
+  });
 }
 
-// ─── Decrypt Balance (move encrypted → public) ───────────────────────────────────
+// ─── Decrypt Balance (encrypted → public) ───────────────────────────────────────
 export async function decryptBalance(wallet, amount) {
-  const nonce = (await getNonce(wallet)) + 1;
-  const raw   = toRaw(amount);
-  const payload = buildTx(wallet, {
+  const raw = toRaw(amount);
+  return buildSignSubmit(wallet, {
     to_:     wallet.address,
     amount:  String(raw),
     ou:      '10000',
     op_type: 'decrypt',
-  }, nonce);
-  return signAndSubmit(wallet, payload);
+  });
 }
 
 // ─── Stealth Send ──────────────────────────────────────────────────────────────
 export async function stealthSend(wallet, recipientAddr, amount) {
-  const nonce = (await getNonce(wallet)) + 1;
-  const payload = buildTx(wallet, {
+  return buildSignSubmit(wallet, {
     to_:     'stealth',
     amount:  '0',
     ou:      '5000',
     op_type: 'stealth',
-  }, nonce);
-  return signAndSubmit(wallet, payload);
+  });
 }
