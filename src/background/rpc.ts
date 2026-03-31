@@ -1,67 +1,119 @@
-import { RPC_URL } from '../shared/constants';
-import type { Transaction } from '../shared/types';
+// Octra RPC client — methods from octra-labs/webcli rpc_client.hpp
+const RPC_URL = 'http://46.101.86.250:8080';
 
-const BASE = RPC_URL;
-
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`);
-  if (!res.ok) throw new Error(`RPC error ${res.status}: ${path}`);
-  return res.json();
-}
-
-async function post<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+async function rpcCall(method: string, params: unknown[] = []): Promise<unknown> {
+  const res = await fetch(`${RPC_URL}/rpc`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ jsonrpc: '2.0', method, params, id: Date.now() }),
   });
-  if (!res.ok) throw new Error(`RPC error ${res.status}: ${path}`);
-  return res.json();
+  const data = await res.json() as { result?: unknown; error?: { message?: string } };
+  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+  return data.result;
 }
 
+// ── Balance & Account ────────────────────────────────────────────────────────
+
 export async function getBalance(address: string): Promise<string> {
-  try {
-    const data = await get<{ balance?: string; amount?: string }>(`/balance/${address}`);
-    return data.balance ?? data.amount ?? '0';
-  } catch {
-    return '0';
-  }
+  const result = await rpcCall('octra_balance', [address]);
+  return String(result ?? '0');
+}
+
+export async function getAccount(address: string, limit = 20) {
+  return rpcCall('octra_account', [address, limit]);
 }
 
 export async function getNonce(address: string): Promise<number> {
-  try {
-    const data = await get<{ nonce?: number }>(`/nonce/${address}`);
-    return data.nonce ?? 0;
-  } catch {
-    return 0;
-  }
+  const account = await getAccount(address) as { nonce?: number };
+  return account?.nonce ?? 0;
 }
 
-export async function broadcastTx(txHex: string): Promise<{ hash: string }> {
-  return post<{ hash: string }>('/broadcast', { tx: txHex });
+export async function getTxsByAddress(address: string, limit = 50, offset = 0) {
+  return rpcCall('octra_transactionsByAddress', [address, limit, offset]);
 }
 
-export async function getTransaction(hash: string): Promise<Transaction | null> {
-  try {
-    return await get<Transaction>(`/tx/${hash}`);
-  } catch {
-    return null;
-  }
+export async function getTransaction(hash: string) {
+  return rpcCall('octra_transaction', [hash]);
 }
 
-export async function getTransactions(address: string, limit = 20): Promise<Transaction[]> {
-  try {
-    const data = await get<{ transactions?: Transaction[] }>(`/transactions/${address}?limit=${limit}`);
-    return data.transactions ?? [];
-  } catch {
-    return [];
-  }
+// ── Submit Transaction ───────────────────────────────────────────────────────
+// Method: octra_submit — params: [txObject]
+
+export async function submitTx(tx: object): Promise<string> {
+  const result = await rpcCall('octra_submit', [tx]);
+  return String(result);
 }
 
-export async function getNetworkInfo(): Promise<{ height: number; peers: number }> {
-  try {
-    return await get<{ height: number; peers: number }>('/info');
-  } catch {
-    return { height: 0, peers: 0 };
-  }
+// ── FHE / PVAC ───────────────────────────────────────────────────────────────
+
+export async function getEncryptedBalance(
+  address: string,
+  sigB64: string,
+  pubB64: string
+) {
+  return rpcCall('octra_encryptedBalance', [address, sigB64, pubB64]);
+}
+
+export async function getEncryptedCipher(address: string) {
+  return rpcCall('octra_encryptedCipher', [address]);
+}
+
+export async function registerPvacPubkey(
+  address: string,
+  pkB64: string,
+  sigB64: string,
+  pubB64: string,
+  aesKatHex = ''
+) {
+  return rpcCall('octra_registerPvacPubkey', [address, pkB64, sigB64, pubB64, aesKatHex]);
+}
+
+export async function getPvacPubkey(address: string) {
+  return rpcCall('octra_pvacPubkey', [address]);
+}
+
+// ── Stealth ──────────────────────────────────────────────────────────────────
+
+export async function getStealthOutputs(fromEpoch = 0) {
+  return rpcCall('octra_stealthOutputs', [fromEpoch]);
+}
+
+export async function getViewPubkey(address: string) {
+  return rpcCall('octra_viewPubkey', [address]);
+}
+
+export async function registerPublicKey(
+  address: string,
+  pubB64: string,
+  sigB64: string
+) {
+  return rpcCall('octra_registerPublicKey', [address, pubB64, sigB64]);
+}
+
+// ── Staging ──────────────────────────────────────────────────────────────────
+
+export async function stagingView() {
+  return rpcCall('staging_view', []);
+}
+
+// ── Smart Contracts ──────────────────────────────────────────────────────────
+
+export async function compileAssembly(source: string) {
+  return rpcCall('octra_compileAssembly', [source]);
+}
+
+export async function compileAml(source: string) {
+  return rpcCall('octra_compileAml', [source]);
+}
+
+export async function listContracts() {
+  return rpcCall('octra_listContracts', []);
+}
+
+export async function vmContract(address: string) {
+  return rpcCall('vm_contract', [address]);
+}
+
+export async function contractReceipt(hash: string) {
+  return rpcCall('contract_receipt', [hash]);
 }
