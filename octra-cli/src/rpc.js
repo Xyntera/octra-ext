@@ -26,6 +26,8 @@ async function rpcCall(method, params = [], timeout = 10000) {
   }
 }
 
+// ─── Balance ──────────────────────────────────────────────────────────────────
+
 export async function getBalance(address) {
   const r = await rpcCall('octra_getBalance', [address]);
   if (r?.balance_raw !== undefined) return (Number(r.balance_raw) / 1e6).toFixed(6);
@@ -36,6 +38,8 @@ export async function getBalance(address) {
 export async function getAccount(address, timeout = 10) {
   return rpcCall('octra_getBalance', [address], timeout * 1000);
 }
+
+// ─── Transactions ──────────────────────────────────────────────────────────
 
 export async function submitTx(txJson) {
   return rpcCall('octra_sendTransaction', [txJson]);
@@ -67,6 +71,29 @@ export async function getViewPubkey(address) {
 export async function registerPublicKey(address, pubKeyB64, signature) {
   return rpcCall('octra_registerPublicKey', [address, pubKeyB64, signature]);
 }
+
+// ─── FHE / Encrypted balance ─────────────────────────────────────────────────
+
+// GET /octra_getEncryptedBalance  — requires signed request
+export async function getEncryptedBalance(address, signature, pubKeyB64) {
+  return rpcCall('octra_getEncryptedBalance', [address, signature, pubKeyB64]);
+}
+
+// GET raw cipher for an address (no auth)
+export async function getEncryptedCipher(address) {
+  return rpcCall('octra_getEncryptedCipher', [address]);
+}
+
+// ─── Stealth ──────────────────────────────────────────────────────────────────
+
+export async function getStealthOutputs(fromEpoch = 0) {
+  const r = await rpcCall('octra_getStealthOutputs', [fromEpoch]);
+  // Response may be array or { outputs: [] }
+  if (Array.isArray(r)) return r;
+  return r?.outputs ?? r?.items ?? [];
+}
+
+// ─── Generic raw call ──────────────────────────────────────────────────────────
 
 export async function rpcRawCall(method, params = []) {
   return rpcCall(method, params);
